@@ -116,21 +116,8 @@ describe('hash media attachment resolver', () => {
 
 function fakeChannel(bytes: Buffer) {
   return {
-    rawClient: {
-      im: {
-        v1: {
-          messageResource: {
-            get: async () => ({
-              writeFile: async (path: string) => {
-                await writeFile(path, bytes);
-              },
-              headers: {
-                'content-type': 'image/png',
-              },
-            }),
-          },
-        },
-      },
+    async downloadResourceWithMeta() {
+      return { buffer: bytes, contentType: 'image/png' };
     },
   } as never;
 }
