@@ -7,6 +7,7 @@ import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../..
 import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
 import type { AgentBotIdentity, AgentEvent, AgentRun, AgentRunOptions } from '../types';
+import pkg from '../../../package.json';
 
 type Child = SpawnedProcessByStdio<Writable, Readable, Readable>;
 type Json = Record<string, unknown>;
@@ -41,6 +42,7 @@ export class CodexAppServerRuntime {
     let terminal = false;
     let stopped = false;
     let connected: AppServerClient | undefined;
+    const translator = new AppServerTurnTranslator();
 
     const emit = (event: AgentEvent): void => {
       if (terminal) return;
@@ -69,7 +71,7 @@ export class CodexAppServerRuntime {
         if (!threadId) throw new Error('app-server response did not contain a thread id');
         emit({ type: 'system', threadId, cwd: options.cwd });
         const unsubscribe = connected.subscribe(threadId, (message) => {
-          for (const event of translateNotification(message)) emit(event);
+          for (const event of translator.translate(message)) emit(event);
         });
         try {
           const turn = await connected.request('turn/start', {
@@ -145,6 +147,10 @@ class AppServerClient {
 
   async request(method: string, params: Json): Promise<Json> {
     await this.connect();
+    return this.sendRequest(method, params);
+  }
+
+  private sendRequest(method: string, params: Json): Promise<Json> {
     const child = this.child;
     if (!child) throw new Error('app-server proxy is unavailable');
     const id = this.nextId++;
@@ -189,8 +195,8 @@ class AppServerClient {
     });
     this.lineReader = createInterface({ input: child.stdout, crlfDelay: Infinity });
     this.lineReader.on('line', (line) => this.onLine(line));
-    await this.request('initialize', {
-      clientInfo: { name: 'lark-channel-bridge', title: 'Lark Channel Bridge', version: '0.2.2' },
+    await this.sendRequest('initialize', {
+      clientInfo: { name: 'lark-channel-bridge', title: 'Lark Channel Bridge', version: pkg.version },
       capabilities: null,
     });
   }
@@ -260,35 +266,74 @@ class AppServerClient {
   }
 }
 
-function translateNotification(message: Json): AgentEvent[] {
-  const method = stringValue(message.method);
-  const params = jsonValue(message.params);
-  if (!method || !params) return [];
-  if (method === 'item/agentMessage/delta') {
-    const delta = stringValue(params.delta);
-    return delta ? [{ type: 'text', delta }] : [];
+class AppServerTurnTranslator {
+  private pendingAgentMessage: string | undefined;
+  private readonly agentDeltas = new Map<string, string>();
+
+  translate(message: Json): AgentEvent[] {
+    const method = stringValue(message.method);
+    const params = jsonValue(message.params);
+    if (!method || !params) return [];
+    if (method === 'item/agentMessage/delta') {
+      const itemId = stringValue(params.itemId);
+      const delta = stringValue(params.delta);
+      if (itemId && delta) this.agentDeltas.set(itemId, `${this.agentDeltas.get(itemId) ?? ''}${delta}`);
+      return [];
+    }
+    if (method === 'item/started') {
+      const item = jsonValue(params.item);
+      if (item?.type !== 'commandExecution' && item?.type !== 'command_execution') return [];
+      const id = stringValue(item.id);
+      return id ? this.prependPendingText([{ type: 'tool_use', id, name: 'command_execution', input: { command: stringValue(item.command) ?? '' } }]) : [];
+    }
+    if (method === 'item/completed') return this.translateCompletedItem(params);
+    if (method === 'turn/completed') return this.translateTurnCompleted(params);
+    if (method === 'turn/failed' || method === 'error') {
+      return this.prependPendingText([{ type: 'error', message: stringValue(params.message) ?? 'codex app-server turn failed', terminationReason: 'failed' }]);
+    }
+    return [];
   }
-  if (method === 'item/started') {
+
+  private translateCompletedItem(params: Json): AgentEvent[] {
     const item = jsonValue(params.item);
-    if (item?.type !== 'commandExecution' && item?.type !== 'command_execution') return [];
-    const id = stringValue(item.id);
-    return id ? [{ type: 'tool_use', id, name: 'command_execution', input: { command: stringValue(item.command) ?? '' } }] : [];
-  }
-  if (method === 'item/completed') {
-    const item = jsonValue(params.item);
-    if (!item || (item.type !== 'commandExecution' && item.type !== 'command_execution')) return [];
+    if (!item) return [];
+    if (item.type === 'agentMessage' || item.type === 'agent_message') {
+      const id = stringValue(item.id) ?? stringValue(params.itemId);
+      const message = stringValue(item.text ?? item.message) ?? (id ? this.agentDeltas.get(id) : undefined);
+      if (id) this.agentDeltas.delete(id);
+      return message ? this.queueAgentMessage(message) : [];
+    }
+    if (item.type !== 'commandExecution' && item.type !== 'command_execution') return [];
     const id = stringValue(item.id);
     if (!id) return [];
     const exitCode = numberValue(item.exitCode ?? item.exit_code);
-    return [{ type: 'tool_result', id, output: stringValue(item.aggregatedOutput ?? item.aggregated_output ?? item.output) ?? '', isError: exitCode !== undefined && exitCode !== 0 }];
+    return this.prependPendingText([{ type: 'tool_result', id, output: stringValue(item.aggregatedOutput ?? item.aggregated_output ?? item.output) ?? '', isError: exitCode !== undefined && exitCode !== 0 }]);
   }
-  if (method === 'turn/completed') {
-    return [{ type: 'done', threadId: stringValue(params.threadId), terminationReason: 'normal' }];
+
+  private translateTurnCompleted(params: Json): AgentEvent[] {
+    const turn = jsonValue(params.turn);
+    const status = stringValue(turn?.status);
+    if (status === 'failed') return this.prependPendingText([{ type: 'error', message: stringValue(jsonValue(turn?.error)?.message) ?? 'codex app-server turn failed', terminationReason: 'failed' }]);
+    const reason = status === 'interrupted' ? 'interrupted' : 'normal';
+    const events: AgentEvent[] = [];
+    if (this.pendingAgentMessage) events.push({ type: 'final_text', content: this.pendingAgentMessage });
+    events.push({ type: 'done', threadId: stringValue(params.threadId), terminationReason: reason });
+    return events;
   }
-  if (method === 'turn/failed' || method === 'error') {
-    return [{ type: 'error', message: stringValue(params.message) ?? 'codex app-server turn failed', terminationReason: 'failed' }];
+
+  private queueAgentMessage(message: string): AgentEvent[] {
+    if (message === this.pendingAgentMessage) return [];
+    const events = this.pendingAgentMessage ? [{ type: 'text' as const, delta: this.pendingAgentMessage }] : [];
+    this.pendingAgentMessage = message;
+    return events;
   }
-  return [];
+
+  private prependPendingText(events: AgentEvent[]): AgentEvent[] {
+    if (!this.pendingAgentMessage) return events;
+    const pending = this.pendingAgentMessage;
+    this.pendingAgentMessage = undefined;
+    return [{ type: 'text', delta: pending }, ...events];
+  }
 }
 
 class EventQueue implements AsyncIterable<AgentEvent> {

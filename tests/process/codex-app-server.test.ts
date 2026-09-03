@@ -25,7 +25,7 @@ describe('Codex app-server runtime', () => {
     const first = adapter.run({ runId: 'message-1', prompt: 'first prompt', cwd: fake.dir });
     expect(await collect(first.events)).toEqual([
       { type: 'system', threadId: 'thread-1', cwd: fake.dir },
-      { type: 'text', delta: 'hello from app-server' },
+      { type: 'final_text', content: 'hello from app-server' },
       { type: 'done', threadId: 'thread-1', terminationReason: 'normal' },
     ]);
 
@@ -103,7 +103,8 @@ async function createFakeAppServer(): Promise<{
       '      console.log(JSON.stringify({ id: request.id, result: { turn: { id: "turn-1" } } }));',
       '      setTimeout(() => {',
       '        console.log(JSON.stringify({ method: "item/agentMessage/delta", params: { threadId: request.params.threadId, turnId: "turn-1", itemId: "item-1", delta: "hello from app-server" } }));',
-      '        console.log(JSON.stringify({ method: "turn/completed", params: { threadId: request.params.threadId, turn: { id: "turn-1" } } }));',
+      '        console.log(JSON.stringify({ method: "item/completed", params: { threadId: request.params.threadId, item: { id: "item-1", type: "agentMessage", text: "hello from app-server" } } }));',
+      '        console.log(JSON.stringify({ method: "turn/completed", params: { threadId: request.params.threadId, turn: { id: "turn-1", status: "completed" } } }));',
       '      }, 10);',
       '    } else if (request.method === "turn/interrupt") {',
       '      console.log(JSON.stringify({ id: request.id, result: {} }));',
