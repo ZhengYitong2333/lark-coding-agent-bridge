@@ -1,4 +1,4 @@
-import { createInterface } from 'node:readline';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import { log } from '../../core/logger';
@@ -129,7 +129,9 @@ export class CodexAppServerRuntime {
 class AppServerClient {
   private readonly options: CodexAppServerRuntimeOptions;
   private child: Child | undefined;
-  private lineReader: ReturnType<typeof createInterface> | undefined;
+  private upgrade: { resolve: () => void; reject: (error: Error) => void } | undefined;
+  private readBuffer = Buffer.alloc(0);
+  private fragment: { opcode: number; chunks: Buffer[] } | undefined;
   private nextId = 1;
   private connecting: Promise<void> | undefined;
   private readonly pending = new Map<number, { resolve: (value: Json) => void; reject: (error: Error) => void }>();
@@ -154,10 +156,10 @@ class AppServerClient {
     const child = this.child;
     if (!child) throw new Error('app-server proxy is unavailable');
     const id = this.nextId++;
-    const message = `${JSON.stringify({ id, method, params })}\n`;
+    const message = JSON.stringify({ id, method, params });
     return new Promise<Json>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      child.stdin.write(message, 'utf8', (error?: Error | null) => {
+      this.writeFrame(0x1, Buffer.from(message, 'utf8'), (error?: Error | null) => {
         if (!error) return;
         this.pending.delete(id);
         reject(error);
@@ -193,8 +195,14 @@ class AppServerClient {
       const detail = Buffer.concat(stderr).toString('utf8').trim();
       this.fail(new Error(`app-server proxy exited (${code ?? signal ?? 'unknown'})${detail ? `: ${detail.slice(0, 500)}` : ''}`));
     });
-    this.lineReader = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    this.lineReader.on('line', (line) => this.onLine(line));
+    child.stdout.on('data', (chunk: Buffer) => this.onData(chunk));
+    const upgraded = new Promise<void>((resolve, reject) => {
+      this.upgrade = { resolve, reject };
+    });
+    child.stdin.write(this.upgradeRequest(), 'utf8', (error?: Error | null) => {
+      if (error) this.fail(error);
+    });
+    await upgraded;
     await this.sendRequest('initialize', {
       clientInfo: { name: 'lark-channel-bridge', title: 'Lark Channel Bridge', version: pkg.version },
       capabilities: null,
@@ -230,7 +238,102 @@ class AppServerClient {
     }) as Child;
   }
 
-  private onLine(line: string): void {
+  private upgradeRequest(): string {
+    const key = randomBytes(16).toString('base64');
+    return [
+      'GET / HTTP/1.1',
+      'Host: localhost',
+      'Connection: Upgrade',
+      'Upgrade: websocket',
+      'Sec-WebSocket-Version: 13',
+      `Sec-WebSocket-Key: ${key}`,
+      '',
+      '',
+    ].join('\r\n');
+  }
+
+  private onData(chunk: Buffer): void {
+    this.readBuffer = Buffer.concat([this.readBuffer, chunk]);
+    if (this.upgrade) {
+      const boundary = this.readBuffer.indexOf('\r\n\r\n');
+      if (boundary === -1) return;
+      const response = this.readBuffer.subarray(0, boundary).toString('utf8');
+      this.readBuffer = this.readBuffer.subarray(boundary + 4);
+      if (!/^HTTP\/1\.1 101\b/m.test(response)) {
+        this.fail(new Error(`app-server proxy websocket upgrade failed: ${response.split('\r\n', 1)[0] ?? 'invalid response'}`));
+        return;
+      }
+      const upgrade = this.upgrade;
+      this.upgrade = undefined;
+      upgrade.resolve();
+    }
+    this.consumeFrames();
+  }
+
+  private consumeFrames(): void {
+    while (this.readBuffer.length >= 2) {
+      const first = this.readBuffer[0]!;
+      const second = this.readBuffer[1]!;
+      const fin = (first & 0x80) !== 0;
+      const opcode = first & 0x0f;
+      const masked = (second & 0x80) !== 0;
+      let length = second & 0x7f;
+      let offset = 2;
+      if (length === 126) {
+        if (this.readBuffer.length < offset + 2) return;
+        length = this.readBuffer.readUInt16BE(offset);
+        offset += 2;
+      } else if (length === 127) {
+        if (this.readBuffer.length < offset + 8) return;
+        const value = this.readBuffer.readBigUInt64BE(offset);
+        if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+          this.fail(new Error('app-server proxy websocket frame is too large'));
+          return;
+        }
+        length = Number(value);
+        offset += 8;
+      }
+      const maskOffset = offset;
+      if (masked) offset += 4;
+      if (this.readBuffer.length < offset + length) return;
+      const mask = masked ? this.readBuffer.subarray(maskOffset, maskOffset + 4) : undefined;
+      let payload = this.readBuffer.subarray(offset, offset + length);
+      this.readBuffer = this.readBuffer.subarray(offset + length);
+      if (masked) {
+        payload = Buffer.from(payload);
+        for (let index = 0; index < payload.length; index++) payload[index]! ^= mask![index % 4]!;
+      }
+      this.handleFrame(opcode, fin, payload);
+    }
+  }
+
+  private handleFrame(opcode: number, fin: boolean, payload: Buffer): void {
+    if (opcode === 0x8) {
+      this.fail(new Error('app-server proxy websocket closed'));
+      return;
+    }
+    if (opcode === 0x9) {
+      this.writeFrame(0xA, payload);
+      return;
+    }
+    if (opcode === 0xA) return;
+    if (opcode === 0x0) {
+      if (!this.fragment) return;
+      this.fragment.chunks.push(payload);
+      if (!fin) return;
+      const fragment = this.fragment;
+      this.fragment = undefined;
+      if (fragment.opcode === 0x1) this.onMessage(Buffer.concat(fragment.chunks).toString('utf8'));
+      return;
+    }
+    if (!fin) {
+      this.fragment = { opcode, chunks: [payload] };
+      return;
+    }
+    if (opcode === 0x1) this.onMessage(payload.toString('utf8'));
+  }
+
+  private onMessage(line: string): void {
     let message: Json;
     try {
       const parsed: unknown = JSON.parse(line);
@@ -255,14 +358,36 @@ class AppServerClient {
   }
 
   private fail(error: Error): void {
-    this.lineReader?.close();
-    this.lineReader = undefined;
+    const upgrade = this.upgrade;
+    this.upgrade = undefined;
+    upgrade?.reject(error);
     this.child = undefined;
     for (const { reject } of this.pending.values()) reject(error);
     this.pending.clear();
     for (const callbacks of this.subscribers.values()) {
       for (const callback of callbacks) callback({ method: 'turn/failed', params: { message: error.message } });
     }
+  }
+
+  private writeFrame(opcode: number, payload: Buffer, callback?: (error?: Error | null) => void): void {
+    const child = this.child;
+    if (!child) {
+      callback?.(new Error('app-server proxy is unavailable'));
+      return;
+    }
+    const mask = randomBytes(4);
+    const length = payload.length;
+    const header: number[] = [0x80 | opcode];
+    if (length < 126) header.push(0x80 | length);
+    else if (length <= 0xffff) header.push(0x80 | 126, (length >>> 8) & 0xff, length & 0xff);
+    else {
+      const encodedLength = Buffer.alloc(8);
+      encodedLength.writeBigUInt64BE(BigInt(length));
+      header.push(0x80 | 127, ...encodedLength);
+    }
+    const maskedPayload = Buffer.from(payload);
+    for (let index = 0; index < maskedPayload.length; index++) maskedPayload[index]! ^= mask[index % 4]!;
+    child.stdin.write(Buffer.concat([Buffer.from(header), mask, maskedPayload]), callback);
   }
 }
 
