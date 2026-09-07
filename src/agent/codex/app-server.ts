@@ -59,12 +59,14 @@ export class CodexAppServerRuntime {
           ? await connected.request('thread/resume', {
               threadId,
               cwd: options.cwd,
+              config: this.threadConfig(),
               developerInstructions: buildBridgeSystemPrompt(this.options.getBotIdentity()),
             })
           : await connected.request('thread/start', {
               cwd: options.cwd,
               sandbox: options.sandbox ?? this.options.sandbox,
               approvalPolicy: 'never',
+              config: this.threadConfig(),
               developerInstructions: buildBridgeSystemPrompt(this.options.getBotIdentity()),
             });
         threadId = threadIdFrom(start) ?? threadId;
@@ -123,6 +125,21 @@ export class CodexAppServerRuntime {
   async close(): Promise<void> {
     await this.client?.close();
     this.client = undefined;
+  }
+
+  /**
+   * The app-server daemon is long-lived, so the bridge process environment is
+   * not inherited by its tool processes. Put bridge-bound variables in each
+   * thread's shell policy instead. This is also applied on resume so existing
+   * Lark conversations recover without needing to discard their session.
+   */
+  private threadConfig(): Json {
+    return {
+      shell_environment_policy: {
+        inherit: 'all',
+        set: buildLarkChannelEnv(this.options.larkChannel),
+      },
+    };
   }
 }
 

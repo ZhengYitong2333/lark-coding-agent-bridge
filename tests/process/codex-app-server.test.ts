@@ -20,6 +20,12 @@ describe('Codex app-server runtime', () => {
       profileStateDir: fake.dir,
       runtime: 'app-server',
       sandbox: 'read-only',
+      larkChannel: {
+        profile: 'codex',
+        rootDir: '/tmp/lark-channel',
+        larkCliConfigDir: '/tmp/lark-channel/profiles/codex/lark-cli',
+        larkCliSourceConfigFile: '/tmp/lark-channel/profiles/codex/lark-cli-source/config.json',
+      },
     });
 
     const first = adapter.run({ runId: 'message-1', prompt: 'first prompt', cwd: fake.dir });
@@ -51,6 +57,25 @@ describe('Codex app-server runtime', () => {
     }>;
     expect(requests.find((request) => request.method === 'thread/start')?.params).toMatchObject({
       developerInstructions: expect.stringContaining('lark-channel-bridge 运行约定'),
+      config: {
+        shell_environment_policy: {
+          inherit: 'all',
+          set: {
+            LARK_CHANNEL: '1',
+            LARK_CHANNEL_PROFILE: 'codex',
+            LARK_CHANNEL_HOME: '/tmp/lark-channel',
+            LARK_CHANNEL_CONFIG: '/tmp/lark-channel/profiles/codex/lark-cli-source/config.json',
+            LARKSUITE_CLI_CONFIG_DIR: '/tmp/lark-channel/profiles/codex/lark-cli',
+          },
+        },
+      },
+    });
+    expect(requests.find((request) => request.method === 'thread/resume')?.params).toMatchObject({
+      config: {
+        shell_environment_policy: {
+          set: { LARK_CHANNEL_PROFILE: 'codex' },
+        },
+      },
     });
     expect(requests.filter((request) => request.method === 'turn/start')[0]?.params.input).toEqual([
       { type: 'text', text: 'first prompt' },
