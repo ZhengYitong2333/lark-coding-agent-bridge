@@ -18,6 +18,7 @@ export interface CodexAppServerRuntimeOptions {
   codexHome?: string;
   inheritCodexHome: boolean;
   sandbox: SandboxMode;
+  reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   larkChannel?: LarkChannelEnvContext;
   getBotIdentity: () => AgentBotIdentity | undefined;
 }
@@ -59,11 +60,13 @@ export class CodexAppServerRuntime {
           ? await connected.request('thread/resume', {
               threadId,
               cwd: options.cwd,
+              model: options.model,
               config: this.threadConfig(),
               developerInstructions: buildBridgeSystemPrompt(this.options.getBotIdentity()),
             })
           : await connected.request('thread/start', {
               cwd: options.cwd,
+              model: options.model,
               sandbox: options.sandbox ?? this.options.sandbox,
               approvalPolicy: 'never',
               config: this.threadConfig(),
@@ -139,6 +142,9 @@ export class CodexAppServerRuntime {
         inherit: 'all',
         set: buildLarkChannelEnv(this.options.larkChannel),
       },
+      ...(this.options.reasoningEffort
+        ? { model_reasoning_effort: this.options.reasoningEffort }
+        : {}),
     };
   }
 }

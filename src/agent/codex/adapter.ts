@@ -27,6 +27,7 @@ export interface CodexAdapterOptions {
   inheritCodexHome?: boolean;
   ignoreUserConfig?: boolean;
   ignoreRules?: boolean;
+  reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   sandbox?: SandboxMode;
   stopGraceMs?: number;
   larkChannel?: LarkChannelEnvContext;
@@ -48,6 +49,7 @@ export class CodexAdapter implements AgentAdapter {
   private readonly defaultStopGraceMs: number;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
   private readonly runtime: 'exec' | 'app-server';
+  private readonly reasoningEffort: CodexAdapterOptions['reasoningEffort'];
   private appServer: CodexAppServerRuntime | undefined;
   private botIdentity: AgentBotIdentity | undefined;
 
@@ -62,6 +64,7 @@ export class CodexAdapter implements AgentAdapter {
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
     this.larkChannel = opts.larkChannel;
     this.runtime = opts.runtime ?? 'exec';
+    this.reasoningEffort = opts.reasoningEffort;
   }
 
   setBotIdentity(identity: AgentBotIdentity): void {
@@ -110,6 +113,7 @@ export class CodexAdapter implements AgentAdapter {
         codexHome: this.codexHome,
         inheritCodexHome: this.inheritCodexHome,
         sandbox: this.sandbox,
+        reasoningEffort: this.reasoningEffort,
         larkChannel: this.larkChannel,
         getBotIdentity: () => this.botIdentity,
       });

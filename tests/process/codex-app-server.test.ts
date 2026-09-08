@@ -20,6 +20,7 @@ describe('Codex app-server runtime', () => {
       profileStateDir: fake.dir,
       runtime: 'app-server',
       sandbox: 'read-only',
+      reasoningEffort: 'medium',
       larkChannel: {
         profile: 'codex',
         rootDir: '/tmp/lark-channel',
@@ -28,7 +29,7 @@ describe('Codex app-server runtime', () => {
       },
     });
 
-    const first = adapter.run({ runId: 'message-1', prompt: 'first prompt', cwd: fake.dir });
+    const first = adapter.run({ runId: 'message-1', prompt: 'first prompt', cwd: fake.dir, model: 'gpt-5.6-terra' });
     expect(await collect(first.events)).toEqual([
       { type: 'system', threadId: 'thread-1', cwd: fake.dir },
       { type: 'final_text', content: 'hello from app-server' },
@@ -57,7 +58,9 @@ describe('Codex app-server runtime', () => {
     }>;
     expect(requests.find((request) => request.method === 'thread/start')?.params).toMatchObject({
       developerInstructions: expect.stringContaining('lark-channel-bridge 运行约定'),
+      model: 'gpt-5.6-terra',
       config: {
+        model_reasoning_effort: 'medium',
         shell_environment_policy: {
           inherit: 'all',
           set: {

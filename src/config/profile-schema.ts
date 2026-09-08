@@ -51,6 +51,8 @@ export interface CodexConfig {
   inheritCodexHome?: boolean;
   ignoreUserConfig?: boolean;
   ignoreRules?: boolean;
+  /** Per-thread reasoning effort for the app-server runtime. */
+  reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 }
 
 export interface AttachmentConfig {
@@ -390,8 +392,13 @@ function normalizeCodex(input: CodexConfig & { flags?: unknown }): CodexConfig {
     inheritCodexHome: input.inheritCodexHome !== false,
     ignoreUserConfig: input.ignoreUserConfig === true,
     ignoreRules: input.ignoreRules !== false,
+    ...(isCodexReasoningEffort(input.reasoningEffort) ? { reasoningEffort: input.reasoningEffort } : {}),
   };
   return codex;
+}
+
+function isCodexReasoningEffort(value: unknown): value is NonNullable<CodexConfig['reasoningEffort']> {
+  return value === 'minimal' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh';
 }
 
 function normalizeComments(_input: unknown): CommentConfig {
